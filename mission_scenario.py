@@ -9,6 +9,9 @@ import argparse
 from time import sleep
 import time
 import yaml
+import heapq
+import math
+
 
 import os
 import csv
@@ -268,60 +271,229 @@ def compute_detour_waypoint(p0, p1, aabb, clearance: float = 1.0):
     return min(valid, key=path_cost)
 
 
+def rects_from_obstacles(obstacles: dict, margin: float = 0.6):
+    """
+    Convert obstacles dict into list of inflated axis-aligned rectangles in XY.
+    Returns list of (xmin, xmax, ymin, ymax, zmin, zmax).
+    """
+    rects = []
+    for _, ob in (obstacles or {}).items():
+        cx, cy, cz = ob["x"], ob["y"], ob["z"]
+        hx = ob["w"] / 2.0 + margin
+        hy = ob["d"] / 2.0 + margin
+        hz = ob["h"] / 2.0 + margin
+        rects.append((cx - hx, cx + hx, cy - hy, cy + hy, cz - hz, cz + hz))
+    return rects
+
+
+def segment_intersects_rect(p0, p1, rect) -> bool:
+    """
+    Liang–Barsky clip test for intersection between segment p0->p1 and axis-aligned rectangle.
+    rect = (xmin, xmax, ymin, ymax, zmin, zmax) but we use only XY.
+    Returns True if segment intersects rectangle interior/boundary.
+    """
+    xmin, xmax, ymin, ymax, *_ = rect
+    x0, y0 = p0
+    x1, y1 = p1
+    dx = x1 - x0
+    dy = y1 - y0
+
+    p = [-dx, dx, -dy, dy]
+    q = [x0 - xmin, xmax - x0, y0 - ymin, ymax - y0]
+
+    u1, u2 = 0.0, 1.0
+    for pi, qi in zip(p, q):
+        if pi == 0:
+            if qi < 0:
+                return False
+        else:
+            t = qi / pi
+            if pi < 0:
+                if t > u2:
+                    return False
+                if t > u1:
+                    u1 = t
+            else:
+                if t < u1:
+                    return False
+                if t < u2:
+                    u2 = t
+    return True
+
+
+def visible(p, q, rects) -> bool:
+    """True if straight segment p->q does NOT intersect any rectangle in rects."""
+    for r in rects:
+        if segment_intersects_rect(p, q, r):
+            return False
+    return True
+
+
+def rect_corners(rect, corner_clearance: float = 0.2):
+    """
+    Return 4 corner points (x,y) for inflated rectangle, with a tiny extra clearance
+    so we don't sit exactly on the boundary.
+    """
+    xmin, xmax, ymin, ymax, *_ = rect
+    return [
+        (xmin - corner_clearance, ymin - corner_clearance),
+        (xmin - corner_clearance, ymax + corner_clearance),
+        (xmax + corner_clearance, ymin - corner_clearance),
+        (xmax + corner_clearance, ymax + corner_clearance),
+    ]
+
+
+def euclid2(a, b) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def build_visibility_graph(start_xy, goal_xy, rects):
+    """
+    Build visibility graph: nodes are start, goal, and rectangle corners.
+    Returns:
+      nodes: list[(x,y)]
+      nbrs: adjacency list, nbrs[i] = list[(j, weight)]
+    """
+    nodes = [start_xy, goal_xy]
+    for r in rects:
+        nodes.extend(rect_corners(r))
+
+    n = len(nodes)
+    nbrs = [[] for _ in range(n)]
+
+    # Connect if visible; O(n^2 * #rects) but small n (good for coursework)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if visible(nodes[i], nodes[j], rects):
+                w = euclid2(nodes[i], nodes[j])
+                nbrs[i].append((j, w))
+                nbrs[j].append((i, w))
+    return nodes, nbrs
+
+
+def astar_graph(nodes, nbrs, start_idx: int, goal_idx: int):
+    """
+    Manual A* on a weighted graph.
+    nodes: list[(x,y)]
+    nbrs: adjacency list
+    Returns list of node indices representing path, or None if no path.
+    """
+    def h(i):
+        return euclid2(nodes[i], nodes[goal_idx])
+
+    open_heap = []
+    heapq.heappush(open_heap, (h(start_idx), 0.0, start_idx))
+
+    came_from = {}
+    gscore = {start_idx: 0.0}
+    closed = set()
+
+    while open_heap:
+        f, g, cur = heapq.heappop(open_heap)
+        if cur in closed:
+            continue
+        if cur == goal_idx:
+            # Reconstruct
+            path = [cur]
+            while cur in came_from:
+                cur = came_from[cur]
+                path.append(cur)
+            path.reverse()
+            return path
+
+        closed.add(cur)
+
+        for nxt, w in nbrs[cur]:
+            tentative = g + w
+            if nxt in closed:
+                continue
+            if tentative < gscore.get(nxt, float("inf")):
+                gscore[nxt] = tentative
+                came_from[nxt] = cur
+                heapq.heappush(open_heap, (tentative + h(nxt), tentative, nxt))
+
+    return None
+
+
+def plan_path_visibility_astar(start_xyz, goal_xyz, obstacles: dict,
+                              margin: float = 0.6,
+                              cruise_z: float = None):
+    """
+    Plan collision-free path in XY using visibility graph + A*.
+    Returns list of XYZ waypoints INCLUDING goal, excluding start.
+    """
+    sx, sy, sz = start_xyz
+    gx, gy, gz = goal_xyz
+
+    rects = rects_from_obstacles(obstacles, margin=margin)
+
+    start_xy = (sx, sy)
+    goal_xy = (gx, gy)
+
+    # If straight line is already clear, just go direct
+    if visible(start_xy, goal_xy, rects):
+        z = cruise_z if cruise_z is not None else gz
+        return [[gx, gy, z]]
+
+    nodes, nbrs = build_visibility_graph(start_xy, goal_xy, rects)
+    path_idx = astar_graph(nodes, nbrs, start_idx=0, goal_idx=1)
+
+    # Fallback: if graph fails (rare), go direct (your old detour could be used here instead)
+    if path_idx is None:
+        z = cruise_z if cruise_z is not None else gz
+        return [[gx, gy, z]]
+
+    z = cruise_z if cruise_z is not None else gz
+
+    # Convert node indices to waypoints; skip index 0 (start)
+    waypoints = []
+    for k in path_idx[1:]:
+        x, y = nodes[k]
+        waypoints.append([x, y, z])
+
+    # Ensure last waypoint is exactly the goal XY (numerical safety)
+    waypoints[-1][0] = gx
+    waypoints[-1][1] = gy
+    return waypoints
+
+
 def go_to_safe(drone_interface: DroneInterface, start_xyz, goal_vp, obstacles: dict) -> bool:
     """
-    Fly from start_xyz to goal_vp.
-    If straight-line in XY intersects any obstacle footprint, insert a detour waypoint + Z safety hop.
-    Accumulates commanded distance + detour count into METRICS.
+    Uses visibility graph + A* to produce a collision-free XY path.
+    Flies intermediate waypoints using go_to_point, then final approach with yaw.
     """
     sx, sy, sz = start_xyz
     gx, gy, gz = goal_vp["x"], goal_vp["y"], goal_vp["z"]
+    goal_xyz = [gx, gy, gz]
 
-    p0 = (sx, sy)
-    p1 = (gx, gy)
+    # Cruise altitude: keep current or use goal altitude (pick one)
+    cruise_z = max(sz, gz)  # simple and stable
 
-    detoured = False
-    detour_aabb = None
-    detour_xy = None
+    waypoints = plan_path_visibility_astar(
+        start_xyz=[sx, sy, sz],
+        goal_xyz=goal_xyz,
+        obstacles=obstacles,
+        margin=0.6,
+        cruise_z=cruise_z
+    )
 
-    for _, ob in (obstacles or {}).items():
-        aabb = obstacle_aabb(ob, margin=0.6)
-        if segment_intersects_aabb_2d(p0, p1, aabb):
-            detour_xy = compute_detour_waypoint(p0, p1, aabb, clearance=1.0)
-            detoured = True
-            detour_aabb = aabb
-            break
-
-    if detoured and detour_xy is not None and detour_aabb is not None:
+    # Detour metric: if planner gave >1 waypoint, it had to go around something
+    if len(waypoints) > 1:
         METRICS["detours"] += 1
 
-        wx, wy = detour_xy
-        zmax = detour_aabb[5]
-        safe_z = max(sz, gz, zmax + 0.8)
-
-        # 1) climb
-        climb = [sx, sy, safe_z]
-        add_leg_distance([sx, sy, sz], climb)
-        ok = drone_interface.go_to.go_to_point(climb, speed=SPEED)
+    # Fly intermediate waypoints (excluding final goal, which we do with yaw)
+    cur = [sx, sy, sz]
+    for wp in waypoints[:-1]:
+        add_leg_distance(cur, wp)
+        ok = drone_interface.go_to.go_to_point(wp, speed=SPEED)
         if not ok:
             return False
+        cur = wp
 
-        # 2) move to detour at safe altitude
-        mid = [wx, wy, safe_z]
-        add_leg_distance(climb, mid)
-        ok = drone_interface.go_to.go_to_point(mid, speed=SPEED)
-        if not ok:
-            return False
-
-        # 3) final approach with yaw
-        goal = [gx, gy, gz]
-        add_leg_distance(mid, goal)
-        return drone_interface.go_to.go_to_point_with_yaw(goal, angle=goal_vp["w"], speed=SPEED)
-
-    # No detour: direct
-    goal = [gx, gy, gz]
-    add_leg_distance([sx, sy, sz], goal)
-    return drone_interface.go_to.go_to_point_with_yaw(goal, angle=goal_vp["w"], speed=SPEED)
+    # Final with yaw at real goal altitude
+    final = [gx, gy, gz]
+    add_leg_distance(cur, final)
+    return drone_interface.go_to.go_to_point_with_yaw(final, angle=goal_vp["w"], speed=SPEED)
 
 
 def drone_run(

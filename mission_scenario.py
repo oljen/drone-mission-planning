@@ -2,23 +2,19 @@
 """
 Mission Planning Coursework - Single drone mission
 
-Features included:
-- TSP ordering:
-    * Euclidean (fast)
-    * A*-weighted (slow unless using heuristic + symmetry)  ✅
-- Motion planning per leg:
-    * Visibility-graph + manual A* (collision-aware) ✅
-- Metrics logging:
-    * time, commanded distance, detours, avg speed ✅
-- CSV mission log output ✅
-- ArUco detection verification + image saving per viewpoint ✅
+Planner modes:
+- baseline: sequential YAML order
+- tsp_euclid: TSP using Euclidean edge weights
+- tsp_astar: A*-weighted ordering, with exact open-path optimisation for small scenarios
 
-Key fix:
-- If USE_ASTAR_WEIGHTED_TSP=True, we compute the TSP order BEFORE takeoff
-  so the drone doesn't hover "stuck" while planning.
-
-Run:
-  python3 mission_scenario.py -s scenarios/scenario1.yaml
+Features:
+- Visibility-graph + manual A* local planner
+- Path shortcutting
+- Metrics logging: time, commanded distance, detours, avg speed
+- Planning-time logging: TSP + A* planning time
+- CSV mission log output
+- ArUco detection verification + image saving per viewpoint
+- Mission completion summary
 """
 
 __authors__ = "Rafael Perez-Segui + edits by Oljen"
@@ -32,7 +28,8 @@ import os
 import csv
 import math
 import heapq
-from typing import Dict, List, Tuple, Optional, Set
+import itertools
+from typing import List, Optional, Set
 
 import numpy as np
 from python_tsp.exact import solve_tsp_dynamic_programming
@@ -50,30 +47,51 @@ from as2_python_api.drone_interface import DroneInterface
 # -----------------------
 # CONFIG / FLAGS
 # -----------------------
-USE_ASTAR_WEIGHTED_TSP = True          # <-- set True for A*-weighted TSP
-USE_TSP_HEURISTIC = True              # <-- True recommended when A*-weighted (fast)
+USE_TSP_HEURISTIC = True              # recommended for larger problems
+EXACT_OPEN_PATH_LIMIT = 8             # if viewpoints <= this, brute-force best start-aware path
 TAKE_OFF_HEIGHT = 1.0
 TAKE_OFF_SPEED = 1.0
-SLEEP_TIME = 0.5
+SLEEP_TIME = 0.2                      # reduced a bit for speed
 SPEED = 1.0
 LAND_SPEED = 0.5
 
-OBSTACLE_MARGIN = 0.6                 # inflate obstacles in planning
-CORNER_CLEARANCE = 0.2                # push visibility nodes away from obstacle edges
-CRUISE_Z_MODE = "max"                 # "max" -> max(current, goal), or "goal"
-REQUIRED_ARUCO_IDS = None  # e.g. {24,34,44,54,64} or None to auto from first run 
+OBSTACLE_MARGIN = 0.6
+CORNER_CLEARANCE = 0.2
+CRUISE_Z_MODE = "max"                 # "max" or "goal"
+
+# For strict validation, set e.g. {24, 34, 44, 54, 64}
+REQUIRED_ARUCO_IDS = None
 
 OUTPUT_DIR = "outputs"
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
 CSV_LOG_PATH = os.path.join(OUTPUT_DIR, "mission_log.csv")
+SUMMARY_PATH = os.path.join(OUTPUT_DIR, "mission_summary.txt")
 
-# ROS image topic (you confirmed this exists)
 DEFAULT_IMAGE_TOPIC = "/drone0/sensor_measurements/hd_camera/image_raw"
+
+# Faster but still robust scan
+ARUCO_SCANS = 3
+ARUCO_DT = 0.08
+CAMERA_SETTLE_TIME = 0.15
 
 # -----------------------
 # Metrics store
 # -----------------------
-METRICS = {"distance_m": 0.0, "detours": 0}
+METRICS = {
+    "distance_m": 0.0,
+    "detours": 0,
+    "tsp_planning_time_s": 0.0,
+    "astar_planning_time_s": 0.0,
+    "astar_calls": 0,
+}
+
+
+def reset_metrics():
+    METRICS["distance_m"] = 0.0
+    METRICS["detours"] = 0
+    METRICS["tsp_planning_time_s"] = 0.0
+    METRICS["astar_planning_time_s"] = 0.0
+    METRICS["astar_calls"] = 0
 
 
 def add_leg_distance(a, b):
@@ -84,21 +102,15 @@ def add_leg_distance(a, b):
 # Image grabber for ArUco
 # -----------------------
 class ImageGrabber(Node):
-    """
-    Robust image grabber:
-    - Topic publishes rgb8 (confirmed), so we convert to RGB then to BGR.
-    - Keeps track of last stamp so grab_fresh can wait for a new frame.
-    """
     def __init__(self, topic: str):
         super().__init__("image_grabber_node")
         self._bridge = CvBridge()
         self._latest_bgr = None
-        self._latest_stamp = None  # (sec, nsec)
+        self._latest_stamp = None
         self._sub = self.create_subscription(Image, topic, self._cb, 10)
 
     def _cb(self, msg: Image):
         try:
-            # Force RGB8 (matches your topic encoding), then convert to BGR for OpenCV
             rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             self._latest_bgr = bgr
@@ -107,9 +119,6 @@ class ImageGrabber(Node):
             self.get_logger().warn(f"Image conversion failed: {e}")
 
     def grab_fresh(self, timeout_s: float = 2.0):
-        """
-        Returns a frame newer than the last observed stamp during this call.
-        """
         t0 = time.time()
         start_stamp = self._latest_stamp
         while time.time() - t0 < timeout_s:
@@ -118,7 +127,7 @@ class ImageGrabber(Node):
                 continue
             if start_stamp is None or self._latest_stamp != start_stamp:
                 return self._latest_bgr
-        return self._latest_bgr  # fallback: return latest even if not "fresh"
+        return self._latest_bgr
 
 
 def detect_aruco_ids(bgr) -> List[int]:
@@ -127,7 +136,6 @@ def detect_aruco_ids(bgr) -> List[int]:
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-    # Try the most common dictionaries used in coursework sims
     dict_candidates = [
         cv2.aruco.DICT_4X4_50,
         cv2.aruco.DICT_4X4_100,
@@ -138,7 +146,6 @@ def detect_aruco_ids(bgr) -> List[int]:
     ]
 
     params = cv2.aruco.DetectorParameters()
-    # Slightly more robust defaults
     params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     params.adaptiveThreshWinSizeMin = 3
     params.adaptiveThreshWinSizeMax = 23
@@ -155,11 +162,7 @@ def detect_aruco_ids(bgr) -> List[int]:
     return best_ids
 
 
-def scan_aruco_multi_frame(image_grabber: ImageGrabber, scans: int = 6, dt: float = 0.15) -> List[int]:
-    """
-    Robust detection: grab several frames and union the IDs.
-    This avoids "one bad frame" issues when you arrive at a viewpoint.
-    """
+def scan_aruco_multi_frame(image_grabber: ImageGrabber, scans: int = ARUCO_SCANS, dt: float = ARUCO_DT) -> List[int]:
     seen: Set[int] = set()
     for _ in range(scans):
         bgr = image_grabber.grab_fresh(timeout_s=1.0)
@@ -191,7 +194,6 @@ def segment_intersects_rect(p0, p1, rect) -> bool:
     dx = x1 - x0
     dy = y1 - y0
 
-    # Liang–Barsky clip test
     p = [-dx, dx, -dy, dy]
     q = [x0 - xmin, xmax - x0, y0 - ymin, ymax - y0]
 
@@ -287,25 +289,52 @@ def astar_graph(nodes, nbrs, start_idx: int, goal_idx: int):
     return None
 
 
+def shortcut_waypoints(start_xyz, waypoints, rects):
+    """
+    Remove unnecessary intermediate waypoints if later points are directly visible.
+    waypoints excludes start, includes goal.
+    """
+    if len(waypoints) <= 1:
+        return waypoints
+
+    pts = [start_xyz] + waypoints
+    simplified = [pts[0]]
+    i = 0
+    while i < len(pts) - 1:
+        j = len(pts) - 1
+        while j > i + 1:
+            if visible((pts[i][0], pts[i][1]), (pts[j][0], pts[j][1]), rects):
+                break
+            j -= 1
+        simplified.append(pts[j])
+        i = j
+
+    return simplified[1:]
+
+
 def plan_path_visibility_astar(start_xyz, goal_xyz, obstacles: dict,
-                              margin: float = OBSTACLE_MARGIN,
-                              cruise_z: Optional[float] = None):
+                               margin: float = OBSTACLE_MARGIN,
+                               cruise_z: Optional[float] = None):
+    t0 = time.time()
+    METRICS["astar_calls"] += 1
+
     sx, sy, sz = start_xyz
     gx, gy, gz = goal_xyz
 
     rects = rects_from_obstacles(obstacles, margin=margin)
     start_xy = (sx, sy)
     goal_xy = (gx, gy)
-
     z = cruise_z if cruise_z is not None else gz
 
     if visible(start_xy, goal_xy, rects):
+        METRICS["astar_planning_time_s"] += (time.time() - t0)
         return [[gx, gy, z]]
 
     nodes, nbrs = build_visibility_graph(start_xy, goal_xy, rects)
     path_idx = astar_graph(nodes, nbrs, start_idx=0, goal_idx=1)
 
     if path_idx is None:
+        METRICS["astar_planning_time_s"] += (time.time() - t0)
         return [[gx, gy, z]]
 
     waypoints = []
@@ -315,6 +344,10 @@ def plan_path_visibility_astar(start_xyz, goal_xyz, obstacles: dict,
 
     waypoints[-1][0] = gx
     waypoints[-1][1] = gy
+
+    waypoints = shortcut_waypoints(start_xyz, waypoints, rects)
+
+    METRICS["astar_planning_time_s"] += (time.time() - t0)
     return waypoints
 
 
@@ -329,8 +362,12 @@ def planned_path_length(start_xyz, goal_xyz, obstacles) -> float:
 
 
 # -----------------------
-# TSP ordering
+# Ordering
 # -----------------------
+def compute_baseline_order(viewpoint_poses: dict) -> List[int]:
+    return list(sorted(viewpoint_poses.keys()))
+
+
 def compute_tsp_order_euclid(viewpoint_poses: dict) -> List[int]:
     vp_ids = sorted(viewpoint_poses.keys())
     pts = np.array([[viewpoint_poses[i]["x"], viewpoint_poses[i]["y"], viewpoint_poses[i]["z"]] for i in vp_ids], dtype=float)
@@ -345,16 +382,71 @@ def compute_tsp_order_euclid(viewpoint_poses: dict) -> List[int]:
     return [vp_ids[k] for k in perm]
 
 
+def compute_best_open_order_exact_astar(viewpoint_poses: dict, drone_start_pose: dict, obstacles: dict) -> List[int]:
+    """
+    Exact open-path optimisation from the drone start pose.
+    For small scenarios only. Objective is:
+      start -> v1 -> v2 -> ... -> vn
+    with no return-to-start/end cycle requirement.
+    """
+    t0 = time.time()
+
+    vp_ids = sorted(viewpoint_poses.keys())
+    n = len(vp_ids)
+    start_xyz = [drone_start_pose["x"], drone_start_pose["y"], TAKE_OFF_HEIGHT]
+
+    # Precompute start->vp and vp->vp costs
+    start_cost = {}
+    pair_cost = {}
+
+    for i, vpid in enumerate(vp_ids):
+        vp = viewpoint_poses[vpid]
+        goal = [vp["x"], vp["y"], vp["z"]]
+        start_cost[vpid] = planned_path_length(start_xyz, goal, obstacles)
+
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            a_id = vp_ids[i]
+            b_id = vp_ids[j]
+            va = viewpoint_poses[a_id]
+            vb = viewpoint_poses[b_id]
+            a = [va["x"], va["y"], va["z"]]
+            b = [vb["x"], vb["y"], vb["z"]]
+            pair_cost[(a_id, b_id)] = planned_path_length(a, b, obstacles)
+
+    best_order = None
+    best_cost = float("inf")
+
+    print(f"Computing exact open-path order from start for {n} viewpoints ({math.factorial(n)} permutations)...")
+
+    for perm in itertools.permutations(vp_ids):
+        total = start_cost[perm[0]]
+        for a, b in zip(perm[:-1], perm[1:]):
+            total += pair_cost[(a, b)]
+
+        if total < best_cost:
+            best_cost = total
+            best_order = list(perm)
+
+    METRICS["tsp_planning_time_s"] = time.time() - t0
+    print(f"Best open-path cost from start: {best_cost:.2f}")
+    return best_order
+
+
 def compute_tsp_order_astar_cost(viewpoint_poses: dict, drone_start_pose: dict, obstacles: dict) -> List[int]:
     """
-    A*-weighted TSP:
-    - dist(i,j) = planned collision-free path length between viewpoints i and j
-    Optimisations:
-    - compute only i<j then mirror (symmetric)
-    - optional heuristic TSP solver (recommended)
+    A*-weighted ordering.
+    Uses exact open-path optimisation for small scenarios, otherwise TSP on pairwise A* costs.
     """
     vp_ids = sorted(viewpoint_poses.keys())
     n = len(vp_ids)
+
+    if n <= EXACT_OPEN_PATH_LIMIT:
+        return compute_best_open_order_exact_astar(viewpoint_poses, drone_start_pose, obstacles)
+
+    t0 = time.time()
 
     print(f"Computing A*-weighted distance matrix for {n} viewpoints (symmetric, ~{n*(n-1)//2} A* legs)...")
 
@@ -377,6 +469,7 @@ def compute_tsp_order_astar_cost(viewpoint_poses: dict, drone_start_pose: dict, 
     else:
         perm, _ = solve_tsp_dynamic_programming(dist)
 
+    METRICS["tsp_planning_time_s"] = time.time() - t0
     return [vp_ids[k] for k in perm]
 
 
@@ -442,7 +535,22 @@ def write_csv_log(rows: List[dict], csv_path: str):
         w.writerows(rows)
 
 
-def drone_run(drone_interface: DroneInterface, scenario: dict, scenario_path: str, image_grabber: ImageGrabber, order: List[int]) -> bool:
+def write_summary_file(scenario_name: str, mission_complete: bool, visited_ids: Set[int], duration: float):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(SUMMARY_PATH, "w") as f:
+        f.write(f"Scenario: {scenario_name}\n")
+        f.write(f"Mission complete: {mission_complete}\n")
+        f.write(f"Detected IDs: {sorted(list(visited_ids))}\n")
+        f.write(f"Distance (m): {METRICS['distance_m']:.2f}\n")
+        f.write(f"Detours: {METRICS['detours']}\n")
+        f.write(f"Avg speed (m/s): {(METRICS['distance_m'] / duration) if duration > 0 else 0.0:.2f}\n")
+        f.write(f"TSP planning time (s): {METRICS['tsp_planning_time_s']:.3f}\n")
+        f.write(f"A* planning time total (s): {METRICS['astar_planning_time_s']:.3f}\n")
+        f.write(f"A* calls: {METRICS['astar_calls']}\n")
+
+
+def drone_run(drone_interface: DroneInterface, scenario: dict, scenario_path: str,
+              image_grabber: ImageGrabber, order: List[int], mode: str):
     print("Run mission")
     print("Visit order:", order)
 
@@ -462,23 +570,20 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, scenario_path: st
         success = go_to_safe(drone_interface, current, vp, obstacles)
         print(f"Go to success: {success}")
         if not success:
-            return False
+            return False, visited_ids
 
         current = [vp["x"], vp["y"], vp["z"]]
         print("Go to done")
 
-        # Small settle time helps for camera updates
-        time.sleep(0.25)
+        time.sleep(CAMERA_SETTLE_TIME)
 
-        # Robust multi-frame ArUco scan
-        ids = scan_aruco_multi_frame(image_grabber, scans=6, dt=0.15)
+        ids = scan_aruco_multi_frame(image_grabber, scans=ARUCO_SCANS, dt=ARUCO_DT)
         ok = len(ids) > 0
         for _id in ids:
             visited_ids.add(_id)
 
         print(f"Aruco detected at vp {vpid}: {ok}, ids={ids}")
 
-        # Save the latest frame we have after scanning
         bgr_save = image_grabber.grab_fresh(timeout_s=0.5)
 
         stamp = int(time.time() * 1000)
@@ -489,6 +594,7 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, scenario_path: st
 
         rows.append({
             "scenario": os.path.basename(scenario_path),
+            "mode": mode,
             "visit_index": idx,
             "viewpoint_id": vpid,
             "vp_x": vp["x"],
@@ -509,7 +615,16 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, scenario_path: st
     print(f"Images saved to: {IMAGES_DIR}")
     print(f"Unique ArUco IDs seen: {sorted(list(visited_ids))}")
 
-    return True
+    if REQUIRED_ARUCO_IDS is not None:
+        missing = set(REQUIRED_ARUCO_IDS) - visited_ids
+        mission_complete = len(missing) == 0
+        print(f"Mission complete: {mission_complete}")
+        print(f"Missing IDs: {sorted(list(missing))}")
+    else:
+        mission_complete = len(visited_ids) > 0
+        print(f"Mission complete (based on any detections): {mission_complete}")
+
+    return mission_complete, visited_ids
 
 
 def drone_end(drone_interface: DroneInterface) -> bool:
@@ -541,6 +656,9 @@ if __name__ == "__main__":
     parser.add_argument("-n", "--namespace", type=str, default="drone0", help="Drone namespace")
     parser.add_argument("-v", "--verbose", action="store_true", default=False)
     parser.add_argument("--image_topic", type=str, default=DEFAULT_IMAGE_TOPIC)
+    parser.add_argument("--mode", type=str, default="tsp_astar",
+                        choices=["baseline", "tsp_euclid", "tsp_astar"],
+                        help="Planner mode")
 
     args = parser.parse_args()
     scenario = read_scenario(args.scenario)
@@ -548,13 +666,21 @@ if __name__ == "__main__":
     viewpoint_poses = scenario["viewpoint_poses"]
     obstacles = scenario.get("obstacles", {})
 
-    # Compute TSP order BEFORE takeoff (so drone doesn't hover while planning)
-    if USE_ASTAR_WEIGHTED_TSP:
+    reset_metrics()
+
+    if args.mode == "baseline":
+        t0 = time.time()
+        order = compute_baseline_order(viewpoint_poses)
+        METRICS["tsp_planning_time_s"] = time.time() - t0
+        print("Visit order (baseline):", order)
+    elif args.mode == "tsp_euclid":
+        t0 = time.time()
+        order = compute_tsp_order_euclid(viewpoint_poses)
+        METRICS["tsp_planning_time_s"] = time.time() - t0
+        print("TSP visit order (Euclid):", order)
+    else:
         order = compute_tsp_order_astar_cost(viewpoint_poses, scenario["drone_start_pose"], obstacles)
         print("TSP visit order (A*-weighted):", order)
-    else:
-        order = compute_tsp_order_euclid(viewpoint_poses)
-        print("TSP visit order (Euclid):", order)
 
     rclpy.init()
 
@@ -567,23 +693,31 @@ if __name__ == "__main__":
     image_grabber = ImageGrabber(args.image_topic)
 
     success = drone_start(uav)
+    mission_complete = False
+    visited_ids = set()
 
     try:
-        METRICS["distance_m"] = 0.0
-        METRICS["detours"] = 0
-
         start_time = time.time()
         if success:
-            success = drone_run(uav, scenario, args.scenario, image_grabber, order)
+            mission_complete, visited_ids = drone_run(
+                uav, scenario, args.scenario, image_grabber, order, args.mode
+            )
         duration = time.time() - start_time
 
         print("---------------------------------")
+        print(f"Mode: {args.mode}")
         print(f"Tour of {args.scenario} took {duration} seconds")
         print(f"Distance (commanded): {METRICS['distance_m']:.2f} m")
         print(f"Detours used: {METRICS['detours']}")
         if duration > 0:
             print(f"Avg speed: {METRICS['distance_m'] / duration:.2f} m/s")
+        print(f"TSP planning time: {METRICS['tsp_planning_time_s']:.3f} s")
+        print(f"A* planning time total: {METRICS['astar_planning_time_s']:.3f} s")
+        print(f"A* calls: {METRICS['astar_calls']}")
+        print(f"Mission complete: {mission_complete}")
         print("---------------------------------")
+
+        write_summary_file(os.path.basename(args.scenario), mission_complete, visited_ids, duration)
 
     except KeyboardInterrupt:
         pass

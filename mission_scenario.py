@@ -32,7 +32,7 @@ import os
 import csv
 import math
 import heapq
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 import numpy as np
 from python_tsp.exact import solve_tsp_dynamic_programming
@@ -61,6 +61,7 @@ LAND_SPEED = 0.5
 OBSTACLE_MARGIN = 0.6                 # inflate obstacles in planning
 CORNER_CLEARANCE = 0.2                # push visibility nodes away from obstacle edges
 CRUISE_Z_MODE = "max"                 # "max" -> max(current, goal), or "goal"
+REQUIRED_ARUCO_IDS = None  # e.g. {24,34,44,54,64} or None to auto from first run 
 
 OUTPUT_DIR = "outputs"
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
@@ -83,35 +84,90 @@ def add_leg_distance(a, b):
 # Image grabber for ArUco
 # -----------------------
 class ImageGrabber(Node):
+    """
+    Robust image grabber:
+    - Topic publishes rgb8 (confirmed), so we convert to RGB then to BGR.
+    - Keeps track of last stamp so grab_fresh can wait for a new frame.
+    """
     def __init__(self, topic: str):
         super().__init__("image_grabber_node")
         self._bridge = CvBridge()
         self._latest_bgr = None
+        self._latest_stamp = None  # (sec, nsec)
         self._sub = self.create_subscription(Image, topic, self._cb, 10)
 
     def _cb(self, msg: Image):
-        self._latest_bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        try:
+            # Force RGB8 (matches your topic encoding), then convert to BGR for OpenCV
+            rgb = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            self._latest_bgr = bgr
+            self._latest_stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
+        except Exception as e:
+            self.get_logger().warn(f"Image conversion failed: {e}")
 
     def grab_fresh(self, timeout_s: float = 2.0):
+        """
+        Returns a frame newer than the last observed stamp during this call.
+        """
         t0 = time.time()
+        start_stamp = self._latest_stamp
         while time.time() - t0 < timeout_s:
             rclpy.spin_once(self, timeout_sec=0.1)
-            if self._latest_bgr is not None:
+            if self._latest_bgr is None:
+                continue
+            if start_stamp is None or self._latest_stamp != start_stamp:
                 return self._latest_bgr
-        return None
+        return self._latest_bgr  # fallback: return latest even if not "fresh"
 
 
 def detect_aruco_ids(bgr) -> List[int]:
     if bgr is None:
         return []
+
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
+
+    # Try the most common dictionaries used in coursework sims
+    dict_candidates = [
+        cv2.aruco.DICT_4X4_50,
+        cv2.aruco.DICT_4X4_100,
+        cv2.aruco.DICT_5X5_50,
+        cv2.aruco.DICT_5X5_100,
+        cv2.aruco.DICT_6X6_50,
+        cv2.aruco.DICT_6X6_100,
+    ]
+
     params = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
-    corners, ids, _ = detector.detectMarkers(gray)
-    if ids is None:
-        return []
-    return [int(x) for x in ids.flatten().tolist()]
+    # Slightly more robust defaults
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    params.adaptiveThreshWinSizeMin = 3
+    params.adaptiveThreshWinSizeMax = 23
+    params.adaptiveThreshWinSizeStep = 10
+
+    best_ids = []
+    for d in dict_candidates:
+        aruco_dict = cv2.aruco.getPredefinedDictionary(d)
+        detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+        corners, ids, _ = detector.detectMarkers(gray)
+        if ids is not None and len(ids) > len(best_ids):
+            best_ids = [int(x) for x in ids.flatten().tolist()]
+
+    return best_ids
+
+
+def scan_aruco_multi_frame(image_grabber: ImageGrabber, scans: int = 6, dt: float = 0.15) -> List[int]:
+    """
+    Robust detection: grab several frames and union the IDs.
+    This avoids "one bad frame" issues when you arrive at a viewpoint.
+    """
+    seen: Set[int] = set()
+    for _ in range(scans):
+        bgr = image_grabber.grab_fresh(timeout_s=1.0)
+        ids = detect_aruco_ids(bgr)
+        for _id in ids:
+            seen.add(_id)
+        time.sleep(dt)
+    return sorted(seen)
 
 
 # -----------------------
@@ -411,19 +467,25 @@ def drone_run(drone_interface: DroneInterface, scenario: dict, scenario_path: st
         current = [vp["x"], vp["y"], vp["z"]]
         print("Go to done")
 
-        bgr = image_grabber.grab_fresh(timeout_s=2.0)
-        ids = detect_aruco_ids(bgr)
+        # Small settle time helps for camera updates
+        time.sleep(0.25)
+
+        # Robust multi-frame ArUco scan
+        ids = scan_aruco_multi_frame(image_grabber, scans=6, dt=0.15)
         ok = len(ids) > 0
         for _id in ids:
             visited_ids.add(_id)
 
         print(f"Aruco detected at vp {vpid}: {ok}, ids={ids}")
 
+        # Save the latest frame we have after scanning
+        bgr_save = image_grabber.grab_fresh(timeout_s=0.5)
+
         stamp = int(time.time() * 1000)
         img_name = f"{os.path.basename(scenario_path).replace('.yaml','')}_vp{vpid}_{stamp}.png"
         img_path = os.path.join(IMAGES_DIR, img_name)
-        if bgr is not None:
-            cv2.imwrite(img_path, bgr)
+        if bgr_save is not None:
+            cv2.imwrite(img_path, bgr_save)
 
         rows.append({
             "scenario": os.path.basename(scenario_path),

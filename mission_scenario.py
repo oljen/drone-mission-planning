@@ -31,6 +31,10 @@ import heapq
 import itertools
 from typing import List, Optional, Set
 
+import subprocess
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
 import numpy as np
 from python_tsp.exact import solve_tsp_dynamic_programming
 from python_tsp.heuristics import solve_tsp_local_search
@@ -74,6 +78,10 @@ ARUCO_SCANS = 3
 ARUCO_DT = 0.08
 CAMERA_SETTLE_TIME = 0.15
 
+
+PATH_POINTS = []
+VIEWPOINT_ORDER = []
+
 # -----------------------
 # Metrics store
 # -----------------------
@@ -92,6 +100,7 @@ def reset_metrics():
     METRICS["tsp_planning_time_s"] = 0.0
     METRICS["astar_planning_time_s"] = 0.0
     METRICS["astar_calls"] = 0
+
 
 
 def add_leg_distance(a, b):
@@ -512,16 +521,24 @@ def go_to_safe(drone_interface: DroneInterface, start_xyz, goal_vp, obstacles: d
         METRICS["detours"] += 1
 
     cur = [sx, sy, sz]
+
+    if len(PATH_POINTS) == 0:
+        PATH_POINTS.append([sx, sy, sz])
+
     for wp in waypoints[:-1]:
         add_leg_distance(cur, wp)
         ok = drone_interface.go_to.go_to_point(wp, speed=SPEED)
         if not ok:
             return False
         cur = wp
+        PATH_POINTS.append(list(cur))
 
     final = [gx, gy, gz]
     add_leg_distance(cur, final)
-    return drone_interface.go_to.go_to_point_with_yaw(final, angle=goal_vp["w"], speed=SPEED)
+    ok = drone_interface.go_to.go_to_point_with_yaw(final, angle=goal_vp["w"], speed=SPEED)
+    if ok:
+        PATH_POINTS.append(list(final))
+    return ok
 
 
 def write_csv_log(rows: List[dict], csv_path: str):
@@ -548,11 +565,168 @@ def write_summary_file(scenario_name: str, mission_complete: bool, visited_ids: 
         f.write(f"A* planning time total (s): {METRICS['astar_planning_time_s']:.3f}\n")
         f.write(f"A* calls: {METRICS['astar_calls']}\n")
 
+        
+
+def cuboid_faces(cx, cy, cz, w, d, h):
+    x0, x1 = cx - w / 2.0, cx + w / 2.0
+    y0, y1 = cy - d / 2.0, cy + d / 2.0
+    z0, z1 = cz - h / 2.0, cz + h / 2.0
+
+    v = np.array([
+        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]
+    ])
+
+    return [
+        [v[0], v[1], v[2], v[3]],
+        [v[4], v[5], v[6], v[7]],
+        [v[0], v[1], v[5], v[4]],
+        [v[2], v[3], v[7], v[6]],
+        [v[1], v[2], v[6], v[5]],
+        [v[0], v[3], v[7], v[4]],
+    ]
+
+
+def generate_path_plots(scenario: dict, scenario_path: str, order: List[int], path_points: List[List[float]]):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    viewpoint_poses = scenario["viewpoint_poses"]
+    obstacles = scenario.get("obstacles", {})
+    start_pose = scenario["drone_start_pose"]
+    scenario_name = os.path.basename(scenario_path).replace(".yaml", "")
+
+    ordered_pts = []
+    for vpid in order:
+        vp = viewpoint_poses[vpid]
+        ordered_pts.append([vp["x"], vp["y"], vp["z"]])
+    ordered_pts = np.array(ordered_pts, dtype=float) if ordered_pts else np.zeros((0, 3))
+
+    path_pts = np.array(path_points, dtype=float) if path_points else np.zeros((0, 3))
+
+    fig = plt.figure(figsize=(14, 10))
+
+    ax2d = fig.add_subplot(1, 2, 1)
+    ax2d.set_title("Drone Mission Path (2D)", fontsize=12, fontweight="bold")
+    ax2d.set_xlabel("X (meters)")
+    ax2d.set_ylabel("Y (meters)")
+    ax2d.grid(True, alpha=0.25)
+
+    first_obstacle = True
+    for _, ob in obstacles.items():
+        rect = plt.Rectangle(
+            (ob["x"] - ob["w"]/2.0, ob["y"] - ob["d"]/2.0),
+            ob["w"], ob["d"],
+            color="gray", alpha=0.35,
+            label="Obstacle" if first_obstacle else None
+        )
+        ax2d.add_patch(rect)
+        first_obstacle = False
+
+    if len(ordered_pts) > 0:
+        ax2d.plot(
+            ordered_pts[:, 0], ordered_pts[:, 1],
+            linestyle="--", linewidth=1.4, color="black", alpha=0.7,
+            label="TSP Route"
+        )
+        ax2d.scatter(
+            ordered_pts[:, 0], ordered_pts[:, 1],
+            color="red", s=22, label="Markers", zorder=3
+        )
+
+    ax2d.scatter(
+        [start_pose["x"]], [start_pose["y"]],
+        color="blue", marker="s", s=45, label="Start Position", zorder=4
+    )
+
+    if len(path_pts) > 0:
+        ax2d.plot(
+            path_pts[:, 0], path_pts[:, 1],
+            color="green", linewidth=2.2, label="Flight Path", zorder=2
+        )
+
+    ax2d.legend(loc="upper right", fontsize=9)
+
+    ax3d = fig.add_subplot(1, 2, 2, projection="3d")
+    ax3d.set_title("Drone Mission Path (3D)", fontsize=12, fontweight="bold")
+    ax3d.set_xlabel("X (meters)")
+    ax3d.set_ylabel("Y (meters)")
+    ax3d.set_zlabel("Z (meters)")
+
+    for _, ob in obstacles.items():
+        faces = cuboid_faces(ob["x"], ob["y"], ob["z"], ob["w"], ob["d"], ob["h"])
+        pc = Poly3DCollection(faces, alpha=0.18, facecolor="gray", edgecolor="gray")
+        ax3d.add_collection3d(pc)
+
+    if len(ordered_pts) > 0:
+        ax3d.plot(
+            ordered_pts[:, 0], ordered_pts[:, 1], ordered_pts[:, 2],
+            linestyle="--", linewidth=1.4, color="black", alpha=0.7,
+            label="TSP Route"
+        )
+        ax3d.scatter(
+            ordered_pts[:, 0], ordered_pts[:, 1], ordered_pts[:, 2],
+            color="red", s=22, label="Markers"
+        )
+
+    ax3d.scatter(
+        [start_pose["x"]], [start_pose["y"]], [start_pose["z"]],
+        color="blue", marker="s", s=45, label="Start Position"
+    )
+
+    if len(path_pts) > 0:
+        ax3d.plot(
+            path_pts[:, 0], path_pts[:, 1], path_pts[:, 2],
+            color="green", linewidth=2.2, label="Flight Path"
+        )
+
+    ax3d.view_init(elev=26, azim=-60)
+
+    all_pts = []
+    if len(ordered_pts) > 0:
+        all_pts.append(ordered_pts)
+    if len(path_pts) > 0:
+        all_pts.append(path_pts)
+
+    if all_pts:
+        all_pts = np.vstack(all_pts)
+        xmin, ymin, zmin = np.min(all_pts, axis=0)
+        xmax, ymax, zmax = np.max(all_pts, axis=0)
+        ax3d.set_xlim(xmin - 1, xmax + 1)
+        ax3d.set_ylim(ymin - 1, ymax + 1)
+        ax3d.set_zlim(min(0, zmin - 1), zmax + 1)
+
+    ax3d.legend(loc="upper right", fontsize=8)
+
+    fig.suptitle(
+        f"{scenario_name.replace('_', ' ').title()} - Drone Mission Path 2D and 3D Plot",
+        fontsize=18,
+        fontweight="bold",
+        y=0.98
+    )
+
+    out_path = os.path.join(OUTPUT_DIR, f"{scenario_name}_path_plot.png")
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Path plot saved to: {out_path}")
+    return out_path
+
+
+def open_plot_image(image_path: str):
+    try:
+        subprocess.Popen(["xdg-open", image_path])
+    except Exception as e:
+        print(f"Could not open plot automatically: {e}")
+
 
 def drone_run(drone_interface: DroneInterface, scenario: dict, scenario_path: str,
               image_grabber: ImageGrabber, order: List[int], mode: str):
     print("Run mission")
     print("Visit order:", order)
+
+    global VIEWPOINT_ORDER
+    VIEWPOINT_ORDER = list(order)
 
     viewpoint_poses = scenario["viewpoint_poses"]
     obstacles = scenario.get("obstacles", {})
@@ -667,6 +841,8 @@ if __name__ == "__main__":
     obstacles = scenario.get("obstacles", {})
 
     reset_metrics()
+    PATH_POINTS.clear()
+    VIEWPOINT_ORDER.clear()
 
     if args.mode == "baseline":
         t0 = time.time()
@@ -718,11 +894,19 @@ if __name__ == "__main__":
         print("---------------------------------")
 
         write_summary_file(os.path.basename(args.scenario), mission_complete, visited_ids, duration)
+        
 
     except KeyboardInterrupt:
         pass
 
     drone_end(uav)
+    plot_path = generate_path_plots(scenario, args.scenario, VIEWPOINT_ORDER, PATH_POINTS)
+
+    try:
+        if 'plot_path' in locals():
+            open_plot_image(plot_path)
+    except Exception as e:
+        print(f"Could not open generated plot: {e}")
 
     uav.shutdown()
     image_grabber.destroy_node()

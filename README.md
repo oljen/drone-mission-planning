@@ -1,18 +1,55 @@
-# Drone Mission Planning (COMP0240)
+# Structural Inspection Path Planning – How to Run
 
-Working solution for structural inspection mission planning:
-- TSP viewpoint ordering (python_tsp)
-- Obstacle-aware safe navigation (AABB footprint intersection + detour waypoint + altitude hop)
-- ArUco verification at each viewpoint + logs (CSV) + saved images
+This project implements an autonomous drone inspection planner using:
 
-## How to run
-Terminal 1:
-./launch_as2.bash -s scenarios/scenarioX.yaml
+- Global TSP viewpoint ordering
+- Obstacle-aware A* local planning
+- Waypoint shortcutting
+- ArUco verification
+- Mission logging and plotting
 
-Terminal 2:
-./launch_ground_station.bash
+The system must be run using **THREE TERMINALS**.
 
-Terminal 3:
+If you do not follow the exact order below, it will not work.
+
+---
+
+# STEP 0 — Open 3 terminals
+
+You will run:
+
+Terminal 1 → Simulation  
+Terminal 2 → Ground station  
+Terminal 3 → Mission script  
+
+---
+
+# STEP 1 — Run the Simulation
+
+In **Terminal 1**, run:
+
+```bash
 source /opt/ros/humble/setup.bash
 source ~/mission_planning_ws/install/setup.bash
-python3 mission_scenario.py -s scenarios/scenarioX.yaml
+
+cd ~/mission_planning_ws/src/challenge_mission_planning
+./launch_as2.bash -s scenarios/scenario2.yaml
+
+# STEP 2
+
+In **Terminal 2**, run:
+
+source /opt/ros/humble/setup.bash
+source ~/mission_planning_ws/install/setup.bash
+
+cd ~/mission_planning_ws/src/challenge_mission_planning
+./launch_ground_station.bash
+
+
+# STEP 3
+
+source /opt/ros/humble/setup.bash
+source ~/mission_planning_ws/install/setup.bash
+
+cd ~/mission_planning_ws/src/challenge_mission_planning
+python3 mission_scenario.py -s scenarios/scenario2.yaml

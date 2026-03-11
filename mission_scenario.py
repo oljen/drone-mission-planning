@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""
-Mission Planning Coursework - Single drone mission
-
-Planner modes:
-- baseline: sequential YAML order
-- tsp_euclid: TSP using Euclidean edge weights
-- tsp_astar: A*-weighted ordering, with exact open-path optimisation for small scenarios
-
-Features:
-- Visibility-graph + manual A* local planner
-- Path shortcutting
-- Metrics logging: time, commanded distance, detours, avg speed
-- Planning-time logging: TSP + A* planning time
-- CSV mission log output
-- ArUco detection verification + image saving per viewpoint
-- Mission completion summary
-"""
-
-__authors__ = "Rafael Perez-Segui + edits by Oljen"
-__license__ = "BSD-3-Clause"
 
 import argparse
 from time import sleep
@@ -51,19 +31,18 @@ from as2_python_api.drone_interface import DroneInterface
 # -----------------------
 # CONFIG / FLAGS
 # -----------------------
-USE_TSP_HEURISTIC = True              # recommended for larger problems
-EXACT_OPEN_PATH_LIMIT = 8             # if viewpoints <= this, brute-force best start-aware path
+USE_TSP_HEURISTIC = True             
+EXACT_OPEN_PATH_LIMIT = 8             
 TAKE_OFF_HEIGHT = 1.0
 TAKE_OFF_SPEED = 1.0
-SLEEP_TIME = 0.2                      # reduced a bit for speed
+SLEEP_TIME = 0.2                      
 SPEED = 1.0
 LAND_SPEED = 0.5
 
 OBSTACLE_MARGIN = 0.6
 CORNER_CLEARANCE = 0.2
-CRUISE_Z_MODE = "max"                 # "max" or "goal"
+CRUISE_Z_MODE = "max"                
 
-# For strict validation, set e.g. {24, 34, 44, 54, 64}
 REQUIRED_ARUCO_IDS = None
 
 OUTPUT_DIR = "outputs"
@@ -73,7 +52,6 @@ SUMMARY_PATH = os.path.join(OUTPUT_DIR, "mission_summary.txt")
 
 DEFAULT_IMAGE_TOPIC = "/drone0/sensor_measurements/hd_camera/image_raw"
 
-# Faster but still robust scan
 ARUCO_SCANS = 3
 ARUCO_DT = 0.08
 CAMERA_SETTLE_TIME = 0.15

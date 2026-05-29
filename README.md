@@ -1,4 +1,4 @@
-# Structural Inspection Path Planning – How to Run
+# Structural Inspection Path Planning – How to Run!
 
 This project implements an autonomous drone inspection planner using:
 
